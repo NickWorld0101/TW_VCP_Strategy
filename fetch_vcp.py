@@ -1,182 +1,158 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from datetime import datetime
+import requests
+import time
+import urllib3
 
-# ─────────────────────────────────────────────
-# 監控清單：上市加 .TW，上櫃加 .TWO
-# 可自行擴充，這裡涵蓋半導體、AI、電子、金融等主流族群
-# ─────────────────────────────────────────────
-STOCK_LIST = [
-    # 半導體 / AI
-    "2330.TW", "2454.TW", "2379.TW", "3711.TW", "2344.TW",
-    # 電子零組件
-    "2317.TW", "2382.TW", "2308.TW", "2357.TW", "3231.TW",
-    # 伺服器 / AI 受惠
-    "3017.TW", "6669.TW", "2376.TW", "3034.TW", "4938.TW",
-    # 金融
-    "2881.TW", "2882.TW", "2891.TW", "2886.TW", "2884.TW",
-    # 傳產 / 其他
-    "1301.TW", "1303.TW", "2002.TW", "1216.TW", "2912.TW",
-]
+# 關閉 SSL 安全警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-SECTOR_MAP = {
-    "2330.TW": "半導體", "2454.TW": "半導體", "2379.TW": "半導體",
-    "3711.TW": "半導體", "2344.TW": "半導體",
-    "2317.TW": "電子", "2382.TW": "電子", "2308.TW": "電子",
-    "2357.TW": "電子", "3231.TW": "電子",
-    "3017.TW": "AI/伺服器", "6669.TW": "AI/伺服器", "2376.TW": "AI/伺服器",
-    "3034.TW": "AI/伺服器", "4938.TW": "AI/伺服器",
-    "2881.TW": "金融", "2882.TW": "金融", "2891.TW": "金融",
-    "2886.TW": "金融", "2884.TW": "金融",
-    "1301.TW": "傳產", "1303.TW": "傳產", "2002.TW": "傳產",
-    "1216.TW": "消費", "2912.TW": "消費",
-}
-
-
-def compute_rs_score(df_close_all: dict, ticker: str) -> int:
-    """
-    簡化版相對強弱 RS 分數（0–99）
-    比較個股近 63 個交易日漲幅 vs 全清單中位數
-    """
+def get_all_tw_stocks():
+    """透過官方 OpenAPI 獲取全台股最新代號與名稱列表"""
+    print("正在獲取全台股最新清單與名稱...")
+    stocks_info = {} # 用來儲存 {代號: 名稱} 的對應
+    
+    # 1. 上市股票 (TWSE)
     try:
-        gains = {}
-        for t, close in df_close_all.items():
-            if len(close) >= 63:
-                gains[t] = (close.iloc[-1] - close.iloc[-63]) / close.iloc[-63]
-        if ticker not in gains or len(gains) < 2:
-            return 50
-        sorted_gains = sorted(gains.values())
-        rank = sorted(gains.keys(), key=lambda x: gains[x]).index(ticker)
-        return int(rank / len(gains) * 99)
-    except Exception:
-        return 50
+        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res = requests.get(url_twse, timeout=10)
+        for item in res.json():
+            stock_id = item.get('Code', '')
+            stock_name = item.get('Name', '').strip()
+            if len(stock_id) == 4 and stock_id.isdigit():
+                stocks_info[f"{stock_id}.TW"] = stock_name
+    except Exception as e:
+        print(f"上市清單獲取失敗: {e}")
 
+    # 2. 上櫃股票 (TPEx)
+    try:
+        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+        res = requests.get(url_tpex, timeout=10, verify=False) 
+        for item in res.json():
+            stock_id = item.get('SecuritiesCompanyCode', '')
+            stock_name = item.get('CompanyName', '').strip()
+            if len(stock_id) == 4 and stock_id.isdigit():
+                stocks_info[f"{stock_id}.TWO"] = stock_name
+    except Exception as e:
+        print(f"上櫃清單獲取失敗: {e}")
 
-def check_vcp(df: pd.DataFrame) -> dict | None:
-    """
-    VCP 核心演算法：
-      1. Minervini 趨勢模板（多頭排列 + 200MA 向上）
-      2. 近 52 週高點 25% 以內
-      3. 成交量縮量（近 10 日量 < 近 50 日均量 * 0.85）
-      4. 計算波動收縮次數、建議進場 Pivot、停損位
-    """
-    if len(df) < 200:
-        return None
+    print(f"✅ 成功取得全台股共 {len(stocks_info)} 檔標的。")
+    return stocks_info
 
-    df = df.copy()
-    df["SMA50"]  = df["Close"].rolling(50).mean()
-    df["SMA150"] = df["Close"].rolling(150).mean()
-    df["SMA200"] = df["Close"].rolling(200).mean()
-    df["VolMA20"] = df["Volume"].rolling(20).mean()
-    df["VolMA50"] = df["Volume"].rolling(50).mean()
-
-    last = df.iloc[-1]
-
-    # ── 趨勢模板 ──
-    if not (last["Close"] > last["SMA50"] > last["SMA150"] > last["SMA200"]):
-        return None
-    if df.iloc[-20]["SMA200"] >= last["SMA200"]:          # 200MA 須向上
-        return None
-
-    # ── 距 52 週高點 ──
-    high_52 = df["High"].tail(252).max()
-    from_high = (last["Close"] - high_52) / high_52 * 100
-    if from_high < -25:
-        return None
-
-    # ── 縮量條件 ──
-    recent_vol  = df["Volume"].tail(10).mean()
-    mid_vol     = float(last["VolMA50"]) if not pd.isna(last["VolMA50"]) else recent_vol
-    if recent_vol > mid_vol * 0.9:                        # 量未縮則略過
-        return None
-    vol_ratio = round(recent_vol / mid_vol, 2)
-
-    # ── 波動收縮次數（VCP 核心）──
-    # 分析近 60 日，每 10 日為一段，計算高低振幅是否持續縮小
-    contractions = 0
-    prev_range = None
-    for i in range(5, 0, -1):
-        segment = df.iloc[-i*10 : -(i-1)*10] if i > 1 else df.iloc[-10:]
-        cur_range = (segment["High"].max() - segment["Low"].min()) / segment["Close"].mean()
-        if prev_range is not None and cur_range < prev_range:
-            contractions += 1
-        prev_range = cur_range
-
-    if contractions < 2:
-        return None
-
-    # ── Pivot Point（近期高點 + 一點突破）──
-    pivot = round(df["High"].tail(20).max() * 1.005, 2)
-    stop  = round(last["SMA50"] * 0.97, 2)
-
-    return {
-        "收盤價":       round(float(last["Close"]), 2),
-        "今日漲跌%":   round((float(last["Close"]) - float(df.iloc[-2]["Close"])) / float(df.iloc[-2]["Close"]) * 100, 2),
-        "距高點%":     round(from_high, 1),
-        "縮量次數":    contractions,
-        "量比":        vol_ratio,
-        "Pivot進場價": pivot,
-        "建議停損":    stop,
-        "更新日期":    df.index[-1].strftime("%Y-%m-%d"),
-    }
-
+def map_industry_sector(stock_id):
+    """根據台股代號區間快速進行粗略產業分類"""
+    id_num = int(stock_id)
+    if id_num in [2330, 2454, 3034, 2379, 3661, 3443, 6415]: return "半導體"
+    if id_num in [2317, 2382, 3231, 6669, 2308, 3017, 2376]: return "AI/伺服器"
+    if 2300 <= id_num <= 2499 or 3000 <= id_num <= 3799 or 6100 <= id_num <= 6299: return "電子"
+    if 2800 <= id_num <= 2899: return "金融"
+    if id_num in [1216, 2912, 5904]: return "消費"
+    if id_num <= 2299 or (9900 <= id_num <= 9999): return "傳產"
+    return "其他"
 
 def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] 開始台股 VCP 掃描（共 {len(STOCK_LIST)} 檔）")
+    start_time = time.time()
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] 開始執行全台股 VCP 進階量化掃描...")
+    
+    stocks_info = get_all_tw_stocks()
+    if not stocks_info:
+        print("❌ 無法取得股票清單，程式終止。")
+        return
 
-    # 批次下載所有股票
-    raw = yf.download(
-        STOCK_LIST, period="1y", group_by="ticker",
-        auto_adjust=True, progress=False, threads=True
-    )
+    all_stocks = list(stocks_info.keys())
+    raw_data_list = []
+    chunk_size = 40 
 
-    # 建立各股收盤價字典，供 RS 計算
-    close_dict: dict[str, pd.Series] = {}
-    for ticker in STOCK_LIST:
+    print("開始下載歷史 K 線數據並計算型態指標...")
+    for i in range(0, len(all_stocks), chunk_size):
+        chunk = all_stocks[i:i+chunk_size]
         try:
-            close_dict[ticker] = raw[ticker]["Close"].dropna()
-        except Exception:
-            pass
+            data = yf.download(chunk, period="1y", group_by='ticker', progress=False, threads=False)
+            current_tickers = chunk if len(chunk) > 1 else [chunk[0]]
+            
+            for stock in current_tickers:
+                try:
+                    if len(chunk) > 1:
+                        if stock not in data.columns.levels[0]: continue
+                        df = data[stock].dropna(subset=['Close'])
+                    else:
+                        df = data.dropna(subset=['Close'])
+                        
+                    if df.empty or len(df) < 200: continue
+                    
+                    df['SMA50'] = df['Close'].rolling(50).mean()
+                    df['SMA150'] = df['Close'].rolling(150).mean()
+                    df['SMA200'] = df['Close'].rolling(200).mean()
+                    df['Vol20MA'] = df['Volume'].rolling(20).mean()
+                    
+                    last = df.iloc[-1]
+                    prev = df.iloc[-2]
+                    
+                    if not (last['Close'] > last['SMA50'] > last['SMA150'] > last['SMA200']): continue
+                    if df.iloc[-20]['SMA200'] >= last['SMA200']: continue
+                    
+                    high_52wk = df['High'].tail(252).max()
+                    if last['Close'] < high_52wk * 0.75: continue
+                    
+                    dist_to_high = ((high_52wk - last['Close']) / high_52wk) * 100
+                    daily_chg = ((last['Close'] - prev['Close']) / prev['Close']) * 100
+                    vol_ratio = df['Volume'].tail(10).mean() / df['Volume'].tail(50).mean() if df['Volume'].tail(50).mean() > 0 else 1.0
+                    
+                    recent_df = df.tail(15)
+                    contract_days = sum((recent_df['Volume'] < recent_df['Vol20MA']) & (recent_df['Volume'] < recent_df['Volume'].shift(1).fillna(0)))
+                    
+                    vcp_score = int(min(99, max(10, ((last['SMA50'] - last['SMA200']) / last['SMA200'] * 200) + (15 - dist_to_high))))
+                    one_year_return = ((last['Close'] - df['Close'].iloc[0]) / df['Close'].iloc[0]) * 100
+                    
+                    pivot_price = round(df['High'].tail(20).max(), 2) 
+                    stop_loss = round(last['Close'] * 0.93, 2) 
+                    clean_id = stock.replace(".TW", "").replace(".TWO", "")
+                    stock_name = stocks_info.get(stock, "") # 取得股票名稱
+                    
+                    raw_data_list.append({
+                        "股票代號": clean_id,
+                        "股票名稱": stock_name, # 新增欄位
+                        "產業": map_industry_sector(clean_id),
+                        "收盤價": round(last['Close'], 2),
+                        "今日漲跌%": daily_chg,
+                        "VCP強度": vcp_score,
+                        "Pivot進場價": pivot_price,
+                        "建議停損": stop_loss,
+                        "距高點%": dist_to_high,
+                        "縮量次數": int(contract_days),
+                        "量比": vol_ratio,
+                        "成交量(股)": int(last['Volume']),
+                        "更新日期": df.index[-1].strftime("%Y-%m-%d"),
+                        "_1y_ret": one_year_return 
+                    })
+                except Exception:
+                    continue
+            
+            print(f"進度: {min(i+chunk_size, len(all_stocks))}/{len(all_stocks)} 檔已掃描...")
+            time.sleep(1)
+        except Exception as e:
+            print(f"⚠️ 批次 {i} 發生異常: {e}")
+            time.sleep(2)
 
-    results = []
-    for ticker in STOCK_LIST:
-        try:
-            df = raw[ticker].dropna()
-        except Exception:
-            continue
-
-        info = check_vcp(df)
-        if info is None:
-            continue
-
-        code = ticker.replace(".TW", "").replace(".TWO", "")
-        rs   = compute_rs_score(close_dict, ticker)
-
-        # VCP 強度分（綜合 RS + 縮量 + 距高點）
-        vcp_score = min(99, int(rs * 0.5 + contractions_score(info["縮量次數"]) + distance_score(info["距高點%"])))
-
-        results.append({
-            "股票代號":    code,
-            "產業":       SECTOR_MAP.get(ticker, "其他"),
-            **info,
-            "RS分數":     rs,
-            "VCP強度":    vcp_score,
-        })
-        print(f"  ✓ {code}  RS={rs}  VCP={vcp_score}  縮量={info['縮量次數']}次")
-
-    # 依 VCP 強度排序
-    df_out = pd.DataFrame(results).sort_values("VCP強度", ascending=False)
-    df_out.to_csv("vcp_today.csv", index=False, encoding="utf-8-sig")
-    print(f"\n掃描完成！共找到 {len(results)} 檔 VCP 個股 → 已寫入 vcp_today.csv")
-
-
-def contractions_score(n: int) -> int:
-    return min(30, n * 10)
-
-def distance_score(pct: float) -> int:
-    # 越接近高點分數越高（-5% → 20分，-25% → 0分）
-    return max(0, int((25 + pct) / 25 * 20))
-
+    if len(raw_data_list) > 0:
+        final_df = pd.DataFrame(raw_data_list)
+        final_df['RS分數'] = final_df['_1y_ret'].rank(pct=True).apply(lambda x: int(x * 100))
+        final_df.drop(columns=['_1y_ret'], inplace=True)
+        final_df = final_df.sort_values(by=["VCP強度", "RS分數"], ascending=[False, False])
+    else:
+        final_df = pd.DataFrame(columns=[
+            "股票代號", "股票名稱", "產業", "收盤價", "今日漲跌%", "RS分數", "VCP強度", 
+            "Pivot進場價", "建議停損", "距高點%", "縮量次數", "量比", "成交量(股)", "更新日期"
+        ])
+        
+    today_str = datetime.now().strftime("%Y%m%d")
+    filename = f"vcp_{today_str}.csv"
+    final_df.to_csv(filename, index=False)
+    
+    end_time = time.time()
+    print(f"🎉 掃描完成！檔案已儲存為 {filename}。共篩選出 {len(final_df)} 檔強勢股。總耗時: {round((end_time - start_time)/60, 2)} 分鐘。")
 
 if __name__ == "__main__":
     main()

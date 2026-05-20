@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+import glob
 from datetime import datetime
 
 # ── 頁面設定 ──────────────────────────────────────────
@@ -50,14 +51,24 @@ st.markdown('<div class="vcp-title">⚡ 台股 VCP 動能選股儀表板</div>',
 st.caption("Volatility Contraction Pattern — 自動掃描符合趨勢模板 + 縮量整理型態的潛力個股")
 st.markdown("---")
 
-# ── 讀取資料 ───────────────────────────────────────────
-DATA_FILE = "vcp_today.csv"
+# ── 讀取資料 (加入智慧尋找最新檔與快取) ──────────────────
+@st.cache_data(ttl=3600)
+def load_latest_data():
+    csv_files = glob.glob("vcp_*.csv")
+    if not csv_files:
+        return None
+    latest_file = max(csv_files)
+    df = pd.read_csv(latest_file)
+    return df, latest_file
 
-if not os.path.exists(DATA_FILE):
-    st.warning("⚠️ 尚未產生資料，請至 GitHub Actions 手動觸發第一次掃描。")
+data_result = load_latest_data()
+
+if data_result is None:
+    st.warning("⚠️ 尚未產生資料，請在終端機執行 `python3 fetch_vcp.py` 或至 GitHub Actions 手動觸發第一次掃描。")
     st.stop()
 
-df = pd.read_csv(DATA_FILE)
+df, current_file = data_result
+st.caption(f"📂 目前讀取檔案：`{current_file}`")
 
 if df.empty:
     st.info("今日無任何個股符合 VCP 條件，明日再來。")
@@ -70,7 +81,7 @@ if sel_sector != "全部產業":
     df_f = df_f[df_f["產業"] == sel_sector]
 df_f = df_f.head(max_rows)
 
-update_date = df["更新日期"].iloc[0]
+update_date = df["更新日期"].iloc[0] if "更新日期" in df.columns and not df.empty else datetime.now().strftime("%Y-%m-%d")
 
 # ── 頂部統計卡片 ───────────────────────────────────────
 c1, c2, c3, c4 = st.columns(4)
@@ -88,7 +99,6 @@ st.markdown("### 🎯 個股清單")
 if df_f.empty:
     st.warning("目前篩選條件下無符合個股，請調寬側邊欄的門檻。")
 else:
-    # 評級
     def rating(row):
         if row["VCP強度"] >= 80 and row["RS分數"] >= 85:
             return "top"
@@ -106,24 +116,26 @@ else:
         with st.container():
             col_title, col_badge = st.columns([3, 1])
             with col_title:
-                st.markdown(f"#### {row['股票代號']}　<small style='color:#888'>{row['產業']}</small>", unsafe_allow_html=True)
+                # 這裡加入了股票名稱顯示，用 get 防止舊資料報錯
+                stock_name = row.get('股票名稱', '')
+                st.markdown(f"#### {row['股票代號']} {stock_name}　<small style='color:#888'>{row['產業']}</small>", unsafe_allow_html=True)
             with col_badge:
-                label = RATING_LABEL[row["評級"]]
-                color = RATING_COLOR[row["評級"]]
+                label = RATING_LABEL[row['評級']]
+                color = RATING_COLOR[row['評級']]
                 st.markdown(f"<span style='color:{color};font-weight:600'>{label}</span>", unsafe_allow_html=True)
 
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("現價", f"${row['收盤價']}")
             chg = row.get("今日漲跌%", 0)
             m2.metric("今日漲跌", f"{chg:+.2f}%", delta=f"{chg:.2f}%")
-            m3.metric("RS 分數", row["RS分數"])
-            m4.metric("VCP 強度", row["VCP強度"])
+            m3.metric("RS 分數", int(row["RS分數"]))
+            m4.metric("VCP 強度", int(row["VCP強度"]))
             m5.metric("Pivot 進場價", f"${row['Pivot進場價']}")
             m6.metric("建議停損", f"${row['建議停損']}")
 
             detail1, detail2, detail3 = st.columns(3)
             detail1.caption(f"距 52 週高點：{row['距高點%']:.1f}%")
-            detail2.caption(f"縮量次數：{row['縮量次數']} 次")
+            detail2.caption(f"縮量次數：{int(row['縮量次數'])} 次")
             detail3.caption(f"量比（近10日/50日均量）：{row['量比']:.2f}")
 
             st.markdown("---")
@@ -134,11 +146,13 @@ if not df_f.empty:
     tab1, tab2 = st.tabs(["VCP 強度 vs RS 分數", "產業分佈"])
 
     with tab1:
+        # 在圖表 hover 資訊中也加入名稱
+        df_f["股票標籤"] = df_f["股票代號"].astype(str) + " " + df_f["股票名稱"].fillna("")
         fig = px.scatter(
             df_f, x="RS分數", y="VCP強度",
             size="收盤價", color="產業",
-            hover_name="股票代號",
-            hover_data={"縮量次數": True, "距高點%": True, "Pivot進場價": True},
+            hover_name="股票標籤",
+            hover_data={"股票代號": False, "股票標籤": False, "縮量次數": True, "距高點%": True, "Pivot進場價": True},
             title="VCP 強度 vs RS 分數（泡泡大小 = 股價）",
             height=420,
         )
@@ -155,8 +169,11 @@ if not df_f.empty:
 
 # ── 完整資料表 ─────────────────────────────────────────
 with st.expander("📋 完整原始資料表（可排序）"):
-    st.dataframe(df_f.drop(columns=["評級"], errors="ignore"),
-                 use_container_width=True, hide_index=True)
+    # 調整顯示順序讓名稱排在前面
+    cols = df_f.columns.tolist()
+    if "股票標籤" in cols: cols.remove("股票標籤")
+    if "評級" in cols: cols.remove("評級")
+    st.dataframe(df_f[cols], use_container_width=True, hide_index=True)
 
 # ── 免責聲明 ───────────────────────────────────────────
 st.markdown("---")
